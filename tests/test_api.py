@@ -1,123 +1,147 @@
-"""Test suite for API endpoints"""
+"""API test suite"""
 import pytest
 from fastapi.testclient import TestClient
-from app.main import app
-from app.core.errors import DatabaseError, ConnectionError
-from unittest.mock import patch, MagicMock
+from sqlalchemy import create_engine
+from pymongo import MongoClient
+import os
+from dotenv import load_dotenv
 
+from app.main import app
+from app.core.config import api_settings
+
+# Load environment variables
+load_dotenv()
+
+# Test client
 client = TestClient(app)
 
+# Test database connections
+postgres_engine = create_engine(os.getenv("TEST_POSTGRESQL_URL"))
+mongo_client = MongoClient(os.getenv("TEST_MONGODB_URL"))
 
-@pytest.fixture
-def mock_db():
-    """Mock database instance"""
-    with patch('app.main.db_instances') as mock:
-        yield mock
+# Test API key
+TEST_API_KEY = os.getenv("TEST_API_KEY")
 
 
-def test_root_endpoint():
-    """Test root endpoint"""
-    response = client.get("/")
-    assert response.status_code == 200
-    assert "version" in response.json()
-    assert "message" in response.json()
+@pytest.fixture(autouse=True)
+def setup_database():
+    """Setup test databases"""
+    # Setup PostgreSQL test data
+    with postgres_engine.connect() as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS test_users (
+                id SERIAL PRIMARY KEY,
+                name VARCHAR(100),
+                email VARCHAR(100)
+            )
+        """)
+        conn.execute("""
+            INSERT INTO test_users (name, email)
+            VALUES ('Test User', 'test@example.com')
+        """)
+
+    # Setup MongoDB test data
+    db = mongo_client.test_db
+    collection = db.test_collection
+    collection.insert_one({"name": "Test User", "email": "test@example.com"})
+
+    yield
+
+    # Cleanup
+    with postgres_engine.connect() as conn:
+        conn.execute("DROP TABLE IF EXISTS test_users")
+    mongo_client.drop_database("test_db")
 
 
 def test_health_check():
     """Test health check endpoint"""
     response = client.get("/health")
     assert response.status_code == 200
-    assert "status" in response.json()
-    assert "databases" in response.json()
-    assert "version" in response.json()
+    data = response.json()
+    assert "status" in data
+    assert "databases" in data
+    assert "version" in data
 
 
-def test_supported_databases():
-    """Test supported databases endpoint"""
-    response = client.get("/supported-databases")
+def test_schema_endpoint():
+    """Test schema endpoint"""
+    response = client.get("/schema", headers={"X-API-Key": TEST_API_KEY})
     assert response.status_code == 200
-    assert "supported_databases" in response.json()
-    assert "current_type" in response.json()
+    data = response.json()
+    assert "schema" in data
+    assert "test_users" in data["schema"]  # PostgreSQL table
+    assert "test_db.test_collection" in data["schema"]  # MongoDB collection
 
 
-def test_get_schema(mock_db):
-    """Test schema retrieval endpoint"""
-    mock_db_instance = MagicMock()
-    mock_db_instance.get_schema.return_value = {"tables": ["users"]}
-    mock_db_instance.validate_connection.return_value = {"version": "1.0"}
-    mock_db.__getitem__.return_value = mock_db_instance
-
-    response = client.get("/schema/postgres")
+def test_query_endpoint_postgresql():
+    """Test PostgreSQL query endpoint"""
+    query = "SELECT * FROM test_users"
+    response = client.post(
+        "/query",
+        json={
+            "query": query,
+            "db_type": "postgresql",
+            "schema": {"test_users": ["id", "name", "email"]}
+        },
+        headers={"X-API-Key": TEST_API_KEY}
+    )
     assert response.status_code == 200
-    assert "source" in response.json()
-    assert "schema" in response.json()
-    assert "metadata" in response.json()
+    data = response.json()
+    assert data["query"] == query
+    assert len(data["result"]) > 0
+    assert "name" in data["result"][0]
+    assert "email" in data["result"][0]
 
 
-def test_process_query_sql(mock_db):
-    """Test SQL query processing"""
-    mock_db_instance = MagicMock()
-    mock_db_instance.get_schema.return_value = {"tables": ["users"]}
-    mock_db_instance.validate_query.return_value = True
-    mock_db_instance.execute_query.return_value = [{"id": 1, "name": "test"}]
-    mock_db.__getitem__.return_value = mock_db_instance
-
-    with patch('app.core.llm.llm_manager.generate_sql_query') as mock_llm:
-        mock_llm.return_value = "SELECT * FROM users"
-        response = client.post(
-            "/query",
-            json={
-                "query": "Show all users",
-                "source": "postgres"
-            }
-        )
-        assert response.status_code == 200
-        assert "query" in response.json()
-        assert "result" in response.json()
+def test_query_endpoint_mongodb():
+    """Test MongoDB query endpoint"""
+    query = "test_db.test_collection"
+    response = client.post(
+        "/query",
+        json={
+            "query": query,
+            "db_type": "mongodb",
+            "schema": {"test_db.test_collection": ["name", "email"]}
+        },
+        headers={"X-API-Key": TEST_API_KEY}
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert data["query"] == query
+    assert len(data["result"]) > 0
+    assert "name" in data["result"][0]
+    assert "email" in data["result"][0]
 
 
-def test_process_query_mongodb(mock_db):
-    """Test MongoDB query processing"""
-    mock_db_instance = MagicMock()
-    mock_db_instance.get_schema.return_value = {"collections": ["users"]}
-    mock_db_instance.validate_query.return_value = True
-    mock_db_instance.execute_query.return_value = [{"_id": 1, "name": "test"}]
-    mock_db.__getitem__.return_value = mock_db_instance
-
-    with patch('app.core.llm.llm_manager.generate_mongo_query') as mock_llm:
-        mock_llm.return_value = {"find": "users"}
-        response = client.post(
-            "/query",
-            json={
-                "query": "Show all users",
-                "source": "mongodb"
-            }
-        )
-        assert response.status_code == 200
-        assert "query" in response.json()
-        assert "result" in response.json()
+def test_invalid_api_key():
+    """Test invalid API key"""
+    response = client.get("/schema", headers={"X-API-Key": "invalid_key"})
+    assert response.status_code == 403
 
 
-def test_invalid_database_source():
-    """Test invalid database source"""
-    response = client.get("/schema/invalid")
+def test_invalid_query():
+    """Test invalid query"""
+    response = client.post(
+        "/query",
+        json={
+            "query": "INVALID SQL QUERY",
+            "db_type": "postgresql",
+            "schema": {"test_users": ["id", "name", "email"]}
+        },
+        headers={"X-API-Key": TEST_API_KEY}
+    )
+    assert response.status_code == 500
+
+
+def test_invalid_db_type():
+    """Test invalid database type"""
+    response = client.post(
+        "/query",
+        json={
+            "query": "SELECT * FROM test_users",
+            "db_type": "invalid_db",
+            "schema": {"test_users": ["id", "name", "email"]}
+        },
+        headers={"X-API-Key": TEST_API_KEY}
+    )
     assert response.status_code == 400
-
-
-def test_invalid_query(mock_db):
-    """Test invalid query handling"""
-    mock_db_instance = MagicMock()
-    mock_db_instance.get_schema.return_value = {"tables": ["users"]}
-    mock_db_instance.validate_query.return_value = False
-    mock_db.__getitem__.return_value = mock_db_instance
-
-    with patch('app.core.llm.llm_manager.generate_sql_query') as mock_llm:
-        mock_llm.return_value = "INVALID SQL"
-        response = client.post(
-            "/query",
-            json={
-                "query": "Invalid query",
-                "source": "postgres"
-            }
-        )
-        assert response.status_code == 400
