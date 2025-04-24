@@ -1,176 +1,135 @@
 """FastAPI application entry point"""
 from fastapi import FastAPI, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
-from typing import Dict, Any
-import time
+from fastapi.security import APIKeyHeader
+from sqlalchemy import create_engine, inspect
+from pymongo import MongoClient
+from typing import Dict, List, Any
+import logging
 
-from app.models.schemas import NLQueryRequest, QueryResponse, HealthResponse, SchemaResponse, MetricsResponse
-from app.databases import PostgresDB, MongoDB, MySQL, SQLite
-from app.core.errors import DatabaseError, ConnectionError, ValidationError, QueryError
+from app.models.schemas import QueryRequest, QueryResponse, HealthResponse, SchemaResponse, MetricsResponse
 from app.core.llm import llm_manager
-from app.core.monitoring import (
-    MonitoringMiddleware, log_query, log_query_duration,
-    update_db_connections, log_llm_request, get_metrics
-)
-from app.core.security import SecurityMiddleware, setup_cors
-from app.config.settings import db_settings, security_settings
-import app
+from app.core.config import api_settings
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # Initialize FastAPI app
 app = FastAPI(
-    title="Natural Language Query Gateway",
-    description="Convert natural language to SQL/NoSQL queries",
-    version=app.__version__,
-    docs_url="/docs" if security_settings.ENABLE_DOCS else None,
-    redoc_url="/redoc" if security_settings.ENABLE_DOCS else None
+    title="PromptQL API",
+    description="Natural language to database query API",
+    version="1.0.0"
 )
 
-# Add middleware
-app.add_middleware(MonitoringMiddleware)
-app.add_middleware(SecurityMiddleware)
-setup_cors(app)
+# Configure CORS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=api_settings.ALLOWED_ORIGINS,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-# Database instances
-db_instances: Dict[str, Any] = {
-    "postgres": PostgresDB(),
-    "mongodb": MongoDB(),
-    "mysql": MySQL(),
-    "sqlite": SQLite()
-}
-
-
-def get_db(source: str):
-    """Get database instance based on source"""
-    if source not in db_instances:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Unsupported database source: {source}"
-        )
-    return db_instances[source]
+# API Key security
+api_key_header = APIKeyHeader(name="X-API-Key")
 
 
-@app.on_event("startup")
-async def startup_event():
-    """Initialize database connections on startup"""
-    for db_type, db in db_instances.items():
-        try:
-            db.connect()
-            update_db_connections(db_type, 1)
-        except ConnectionError as e:
-            logger.error(f"Failed to connect to {db_type}: {str(e)}")
-            update_db_connections(db_type, 0)
+def get_api_key(api_key: str = Depends(api_key_header)):
+    if api_key != api_settings.API_KEY:
+        raise HTTPException(status_code=403, detail="Invalid API key")
+    return api_key
 
 
-@app.get("/", tags=["General"])
-async def root():
-    """Root endpoint"""
-    return {
-        "message": "Welcome to Natural Language Query Gateway",
-        "version": app.__version__
-    }
+# Initialize database connections
+postgres_engine = create_engine(api_settings.POSTGRESQL_URL)
+mongo_client = MongoClient(api_settings.MONGODB_URL)
 
 
-@app.get("/health", response_model=HealthResponse, tags=["General"])
+@app.get("/health", response_model=HealthResponse)
 async def health_check():
     """Health check endpoint"""
-    statuses = {}
-    overall_status = "healthy"
+    try:
+        # Check PostgreSQL connection
+        with postgres_engine.connect() as conn:
+            conn.execute("SELECT 1")
+        postgres_status = "connected"
+    except Exception as e:
+        logger.error(f"PostgreSQL connection error: {str(e)}")
+        postgres_status = "disconnected"
 
-    for db_type, db in db_instances.items():
-        try:
-            db.connect()
-            statuses[db_type] = "connected"
-            update_db_connections(db_type, 1)
-        except ConnectionError:
-            statuses[db_type] = "disconnected"
-            overall_status = "degraded"
-            update_db_connections(db_type, 0)
+    try:
+        # Check MongoDB connection
+        mongo_client.admin.command('ping')
+        mongodb_status = "connected"
+    except Exception as e:
+        logger.error(f"MongoDB connection error: {str(e)}")
+        mongodb_status = "disconnected"
 
     return HealthResponse(
-        status=overall_status,
-        databases=statuses,
-        version=app.__version__
+        status="healthy" if postgres_status == "connected" and mongodb_status == "connected" else "degraded",
+        databases={
+            "postgresql": postgres_status,
+            "mongodb": mongodb_status
+        },
+        version="1.0.0"
     )
 
 
-@app.get("/metrics", response_model=MetricsResponse, tags=["Monitoring"])
-async def get_metrics_endpoint():
-    """Get application metrics"""
-    return MetricsResponse(metrics=get_metrics())
-
-
-@app.get("/schema/{source}", response_model=SchemaResponse, tags=["Schema"])
-async def get_schema(source: str):
+@app.get("/schema", response_model=SchemaResponse)
+async def get_schema(api_key: str = Depends(get_api_key)):
     """Get database schema"""
-    db = get_db(source)
     try:
-        schema = db.get_schema()
-        metadata = db.validate_connection()
-        return SchemaResponse(
-            source=source,
-            schema=schema,
-            metadata=metadata
-        )
-    except DatabaseError as e:
-        logger.error(f"Database error: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
+        # Get PostgreSQL schema
+        inspector = inspect(postgres_engine)
+        postgres_schema = {}
+        for table_name in inspector.get_table_names():
+            columns = [col['name']
+                       for col in inspector.get_columns(table_name)]
+            postgres_schema[table_name] = columns
 
+        # Get MongoDB schema
+        mongodb_schema = {}
+        for db_name in mongo_client.list_database_names():
+            if db_name not in ['admin', 'local']:
+                db = mongo_client[db_name]
+                for collection_name in db.list_collection_names():
+                    # Get sample document to infer fields
+                    sample = db[collection_name].find_one()
+                    if sample:
+                        fields = list(sample.keys())
+                        mongodb_schema[f"{db_name}.{collection_name}"] = fields
 
-@app.post("/query", response_model=QueryResponse, tags=["Query"])
-async def process_query(request: NLQueryRequest):
-    """Process natural language query"""
-    db = get_db(request.source)
-    start_time = time.time()
-
-    try:
-        # Get database schema
-        schema = db.get_schema()
-
-        # Generate database query using LLM
-        if request.source in ["postgres", "mysql", "sqlite"]:
-            dialect = "postgresql" if request.source == "postgres" else request.source
-            query = await llm_manager.generate_sql_query(schema, request.query, dialect)
-            log_llm_request("claude-3-opus")
-        elif request.source == "mongodb":
-            query = await llm_manager.generate_mongo_query(schema, request.query)
-            log_llm_request("claude-3-sonnet")
-        else:
-            raise ValidationError(
-                f"Unsupported database type: {request.source}")
-
-        # Validate generated query
-        if not db.validate_query(query):
-            log_query(request.source, query, "error")
-            raise ValidationError("Generated query is invalid")
-
-        # Execute query
-        result = db.execute_query(query)
-        duration = time.time() - start_time
-        log_query_duration(request.source, duration)
-        log_query(request.source, query)
-
-        return QueryResponse(
-            query=query,
-            result=result
-        )
-    except ValidationError as e:
-        logger.error(f"Validation error: {str(e)}")
-        raise HTTPException(status_code=400, detail=str(e))
-    except QueryError as e:
-        logger.error(f"Query error: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
-    except DatabaseError as e:
-        logger.error(f"Database error: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
+        return SchemaResponse(schema={**postgres_schema, **mongodb_schema})
     except Exception as e:
-        logger.error(f"Unexpected error: {str(e)}")
-        raise HTTPException(status_code=500, detail="Internal server error")
+        logger.error(f"Error getting schema: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.get("/supported-databases", tags=["General"])
-async def get_supported_databases():
-    """Get list of supported databases"""
-    return {
-        "supported_databases": list(db_instances.keys()),
-        "current_type": db_settings.DB_TYPE
-    }
+@app.post("/query", response_model=QueryResponse)
+async def execute_query(request: QueryRequest, api_key: str = Depends(get_api_key)):
+    """Execute natural language query"""
+    try:
+        if request.db_type == "postgresql":
+            # Execute PostgreSQL query
+            with postgres_engine.connect() as conn:
+                result = conn.execute(request.query).fetchall()
+                return QueryResponse(
+                    query=request.query,
+                    result=[dict(row) for row in result]
+                )
+        elif request.db_type == "mongodb":
+            # Execute MongoDB query
+            db_name, collection_name = request.query.split(".", 1)
+            collection = mongo_client[db_name][collection_name]
+            result = list(collection.find())
+            return QueryResponse(
+                query=request.query,
+                result=result
+            )
+        else:
+            raise HTTPException(
+                status_code=400, detail="Invalid database type")
+    except Exception as e:
+        logger.error(f"Error executing query: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
