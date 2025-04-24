@@ -33,13 +33,25 @@ ENV/
 *.swp
 *.swo
 
+# OS
+.DS_Store
+Thumbs.db
+
+# Project specific
+*.log
+.coverage
+htmlcov/
+.pytest_cache/
+.mypy_cache/
+
+# Scripts to ignore
+scripts/create_commit_history.sh
+scripts/staged_commits.sh
+scripts/branch_management.sh
+
 # Database
 *.db
 *.sqlite3
-
-# Logs
-*.log
-logs/
 
 # Environment variables
 .env
