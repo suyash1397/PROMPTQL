@@ -3,9 +3,10 @@ import sys
 from sqlalchemy import create_engine, text
 from sqlalchemy.exc import SQLAlchemyError
 from pymongo import MongoClient
-from pymongo.errors import ConnectionError as MongoConnectionError
+from pymongo.errors import ConnectionFailure as MongoConnectionError
 from app.config import settings
 import logging
+from app.config.settings import get_db_url
 
 # Configure logging
 logging.basicConfig(
@@ -18,13 +19,16 @@ logger = logging.getLogger(__name__)
 def setup_postgres():
     """Setup PostgreSQL database with test data"""
     try:
-        engine = create_engine(settings.DATABASE_URL)
+        engine = create_engine(get_db_url())
 
-        # Create test tables
         with engine.connect() as conn:
+            # Drop tables if they exist (for test setup)
+            conn.execute(text("DROP TABLE IF EXISTS orders"))
+            conn.execute(text("DROP TABLE IF EXISTS users"))
+
             # Create users table
             conn.execute(text("""
-                CREATE TABLE IF NOT EXISTS users (
+                CREATE TABLE users (
                     id SERIAL PRIMARY KEY,
                     name VARCHAR(100),
                     email VARCHAR(100),
@@ -35,7 +39,7 @@ def setup_postgres():
 
             # Create orders table
             conn.execute(text("""
-                CREATE TABLE IF NOT EXISTS orders (
+                CREATE TABLE orders (
                     id SERIAL PRIMARY KEY,
                     user_id INTEGER REFERENCES users(id),
                     amount DECIMAL(10,2),
@@ -50,7 +54,6 @@ def setup_postgres():
                 ('John Doe', 'john@example.com', 30),
                 ('Jane Smith', 'jane@example.com', 25),
                 ('Bob Johnson', 'bob@example.com', 35)
-                ON CONFLICT DO NOTHING
             """))
 
             conn.execute(text("""
@@ -59,7 +62,6 @@ def setup_postgres():
                 (1, 200.75, 'pending'),
                 (2, 50.25, 'completed'),
                 (3, 300.00, 'cancelled')
-                ON CONFLICT DO NOTHING
             """))
 
             conn.commit()
@@ -75,8 +77,10 @@ def setup_postgres():
 def setup_mongodb():
     """Setup MongoDB with test data"""
     try:
-        client = MongoClient(settings.MONGO_URL)
-        db = client.get_default_database()
+        mongo_url = os.getenv("MONGODB_URI", "mongodb://localhost:27017")
+        mongo_db = os.getenv("MONGODB_DB", "nlq_demo")
+        client = MongoClient(mongo_url)
+        db = client[mongo_db]
 
         # Create users collection
         users = db.users

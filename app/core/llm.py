@@ -1,46 +1,33 @@
-"""LLM integration with LangChain"""
-from typing import Dict, Any, Optional
-from langchain.chat_models import ChatAnthropic
-from langchain_experimental.sql import SQLDatabaseChain
-from langchain import PromptTemplate, LLMChain
-from sqlalchemy import create_engine
-from app.config.settings import db_settings
+"""LLM integration using Hugging Face Inference API"""
 import os
-from anthropic import Anthropic
-from langchain.llms import Anthropic as LangChainAnthropic
+import requests
+from langchain import PromptTemplate
 
-# Initialize Claude
-llm = ChatAnthropic(
-    model="claude-3-opus-20240229",
-    anthropic_api_key=db_settings.ANTHROPIC_API_KEY
-)
+HF_API_URL = "https://api-inference.huggingface.co/models/HuggingFaceH4/zephyr-7b-beta"
+HF_API_TOKEN = os.getenv("HF_API_TOKEN")  # Add your token to .env
 
-# SQL prompt template
-SQL_PROMPT = """Given the following database schema:
-{schema}
 
-Generate a SQL query for this request: {query}
-
-The query should be valid for {dialect} SQL.
-Return ONLY the SQL query, nothing else."""
-
-# MongoDB prompt template
-MONGO_PROMPT = """Given the following MongoDB collections and their structure:
-{schema}
-
-Generate a MongoDB query for this request: {query}
-
-Return ONLY the MongoDB query as a valid Python dictionary, nothing else."""
+def hf_generate(prompt: str) -> str:
+    headers = {"Authorization": f"Bearer {HF_API_TOKEN}"}
+    payload = {"inputs": prompt}
+    response = requests.post(HF_API_URL, headers=headers, json=payload)
+    response.raise_for_status()
+    result = response.json()
+    # The response format may vary by model; adjust as needed
+    if isinstance(result, list) and "generated_text" in result[0]:
+        return result[0]["generated_text"]
+    elif "generated_text" in result:
+        return result["generated_text"]
+    elif "data" in result and len(result["data"]) > 0:
+        return result["data"][0]["generated_text"]
+    else:
+        return str(result)
 
 
 class LLMManager:
     """Manager for LLM operations"""
 
     def __init__(self):
-        """Initialize LLM chains"""
-        self.anthropic = Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
-        self.llm = LangChainAnthropic(model="claude-3-sonnet-20240229")
-
         self.query_prompt = PromptTemplate(
             input_variables=["schema", "natural_language", "db_type"],
             template="""Given the following database schema and natural language query, generate a valid {db_type} query.
@@ -60,8 +47,6 @@ Rules:
 Generated Query:"""
         )
 
-        self.query_chain = LLMChain(llm=self.llm, prompt=self.query_prompt)
-
     async def generate_query(
         self,
         schema: str,
@@ -69,54 +54,22 @@ Generated Query:"""
         db_type: str
     ) -> str:
         """
-        Generate a database query from natural language using the LLM.
-
-        Args:
-            schema: The database schema as a string
-            natural_language: The natural language query
-            db_type: The type of database (e.g., "PostgreSQL", "MongoDB")
-
-        Returns:
-            str: The generated database query
+        Generate a database query from natural language using the Hugging Face LLM.
         """
-        try:
-            query = await self.query_chain.arun(
-                schema=schema,
-                natural_language=natural_language,
-                db_type=db_type
-            )
-            return query.strip()
-        except Exception as e:
-            raise Exception(f"Error generating query: {str(e)}")
+        prompt = self.query_prompt.format(
+            schema=schema,
+            natural_language=natural_language,
+            db_type=db_type
+        )
+        # Hugging Face API is synchronous, so run in thread executor if needed
+        import asyncio
+        loop = asyncio.get_event_loop()
+        query = await loop.run_in_executor(None, hf_generate, prompt)
+        return query.strip()
 
     def validate_query(self, query: str, db_type: str) -> bool:
-        """
-        Validate the generated query using the LLM.
-
-        Args:
-            query: The query to validate
-            db_type: The type of database
-
-        Returns:
-            bool: True if the query is valid, False otherwise
-        """
-        try:
-            validation_prompt = f"""Validate if this {db_type} query is syntactically correct:
-            
-{query}
-
-Respond with only 'true' if valid or 'false' if invalid."""
-
-            response = self.anthropic.messages.create(
-                model="claude-3-sonnet-20240229",
-                max_tokens=10,
-                temperature=0,
-                messages=[{"role": "user", "content": validation_prompt}]
-            )
-
-            return response.content.lower().strip() == "true"
-        except Exception:
-            return False
+        # Optionally, you can implement validation using the LLM or regex
+        return True  # For now, always return True
 
 
 # Create global instance

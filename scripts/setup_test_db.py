@@ -13,7 +13,16 @@ sys.path.append(str(project_root))
 
 
 # Database connection strings
-POSTGRES_URL = f"postgresql://{os.getenv('DB_USER')}:{os.getenv('DB_PASSWORD')}@{os.getenv('DB_HOST')}:{os.getenv('DB_PORT')}/{os.getenv('DB_NAME')}"
+# Add at the top
+from urllib.parse import quote_plus
+
+# Update the POSTGRES_URL line (around line 16)
+POSTGRES_URL = (
+    f"postgresql://{quote_plus(os.getenv('DB_USER'))}:"
+    f"{quote_plus(os.getenv('DB_PASSWORD'))}@"
+    f"{os.getenv('DB_HOST')}:{os.getenv('DB_PORT')}/"
+    f"{os.getenv('DB_NAME')}"
+)
 MONGODB_URI = os.getenv('MONGODB_URI')
 MYSQL_CONFIG = {
     'host': os.getenv('MYSQL_HOST'),

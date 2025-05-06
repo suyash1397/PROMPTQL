@@ -2,6 +2,7 @@ import requests
 import json
 import logging
 from typing import Dict, Any
+from sqlalchemy import text
 
 # Configure logging
 logging.basicConfig(

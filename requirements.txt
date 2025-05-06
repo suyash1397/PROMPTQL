@@ -8,12 +8,13 @@ pymongo==4.5.0
 motor>=3.3.0
 
 # LLM & NLP
-langchain==0.0.350
+langchain==0.0.348
 langchain-experimental==0.0.45
 anthropic==0.7.7
 
 # Validation & Settings
 pydantic==2.4.2
+pydantic-settings==2.1.0  # Add this line
 python-dotenv==1.0.0
 psycopg2-binary==2.9.9
 mysql-connector-python==8.2.0
@@ -35,4 +36,4 @@ prometheus-client==0.19.0
 black==23.11.0
 isort==5.12.0
 mypy==1.7.1
-flake8==6.1.0 
+flake8==6.1.0

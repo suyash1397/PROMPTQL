@@ -1,7 +1,9 @@
-from pydantic import BaseSettings, Field
+from pydantic_settings import BaseSettings
+from pydantic import Field, Extra
 from typing import Optional
 import os
 from pathlib import Path
+from urllib.parse import quote_plus
 
 
 class DatabaseSettings(BaseSettings):
@@ -27,11 +29,12 @@ class DatabaseSettings(BaseSettings):
     class Config:
         env_file = ".env"
         case_sensitive = True
+        extra = Extra.allow  # <-- Add this line
 
 
 class APISettings(BaseSettings):
     """API and LLM settings"""
-    ANTHROPIC_API_KEY: str = Field(..., env="ANTHROPIC_API_KEY")
+    # ANTHROPIC_API_KEY: str = Field(..., env="ANTHROPIC_API_KEY")
     API_HOST: str = Field("0.0.0.0", env="API_HOST")
     API_PORT: int = Field(8000, env="API_PORT")
     DEBUG: bool = Field(False, env="DEBUG")
@@ -39,6 +42,7 @@ class APISettings(BaseSettings):
     class Config:
         env_file = ".env"
         case_sensitive = True
+        extra = Extra.allow  # <-- Add this line
 
 
 # Create settings instances
@@ -51,7 +55,9 @@ def get_db_url() -> str:
     if db_settings.DB_TYPE == "sqlite":
         return f"sqlite:///{db_settings.DB_PATH}"
     elif db_settings.DB_TYPE == "postgres":
-        return f"postgresql://{db_settings.DB_USER}:{db_settings.DB_PASSWORD}@{db_settings.DB_HOST}:{db_settings.DB_PORT}/{db_settings.DB_NAME}"
+        user = quote_plus(db_settings.DB_USER)
+        password = quote_plus(db_settings.DB_PASSWORD)
+        return f"postgresql://{user}:{password}@{db_settings.DB_HOST}:{db_settings.DB_PORT}/{db_settings.DB_NAME}"
     elif db_settings.DB_TYPE == "mysql":
         return f"mysql://{db_settings.DB_USER}:{db_settings.DB_PASSWORD}@{db_settings.DB_HOST}:{db_settings.DB_PORT}/{db_settings.DB_NAME}?charset={db_settings.MYSQL_CHARSET}"
     elif db_settings.DB_TYPE == "mongodb":

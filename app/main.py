@@ -2,14 +2,14 @@
 from fastapi import FastAPI, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import APIKeyHeader
-from sqlalchemy import create_engine, inspect
+from sqlalchemy import create_engine, inspect, text
 from pymongo import MongoClient
 from typing import Dict, List, Any
 import logging
 
 from app.models.schemas import QueryRequest, QueryResponse, HealthResponse, SchemaResponse, MetricsResponse
 from app.core.llm import llm_manager
-from app.core.config import api_settings
+from app.config.settings import api_settings, db_settings, get_db_url
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -42,8 +42,12 @@ def get_api_key(api_key: str = Depends(api_key_header)):
 
 
 # Initialize database connections
-postgres_engine = create_engine(api_settings.POSTGRESQL_URL)
-mongo_client = MongoClient(api_settings.MONGODB_URL)
+postgres_engine = create_engine(get_db_url())
+# If you have a separate MongoDB URL, you can construct it similarly:
+# mongo_client = MongoClient(get_mongo_url())
+# Otherwise, use the values from db_settings:
+mongo_url = f"mongodb://{db_settings.DB_HOST}:27017/{db_settings.DB_NAME}"
+mongo_client = MongoClient(mongo_url)
 
 
 @app.get("/health", response_model=HealthResponse)
@@ -52,7 +56,7 @@ async def health_check():
     try:
         # Check PostgreSQL connection
         with postgres_engine.connect() as conn:
-            conn.execute("SELECT 1")
+            conn.execute(text('SELECT 1'))
         postgres_status = "connected"
     except Exception as e:
         logger.error(f"PostgreSQL connection error: {str(e)}")
@@ -78,9 +82,8 @@ async def health_check():
 
 @app.get("/schema", response_model=SchemaResponse)
 async def get_schema(api_key: str = Depends(get_api_key)):
-    """Get database schema"""
+    """Get PostgreSQL database schema only"""
     try:
-        # Get PostgreSQL schema
         inspector = inspect(postgres_engine)
         postgres_schema = {}
         for table_name in inspector.get_table_names():
@@ -88,19 +91,7 @@ async def get_schema(api_key: str = Depends(get_api_key)):
                        for col in inspector.get_columns(table_name)]
             postgres_schema[table_name] = columns
 
-        # Get MongoDB schema
-        mongodb_schema = {}
-        for db_name in mongo_client.list_database_names():
-            if db_name not in ['admin', 'local']:
-                db = mongo_client[db_name]
-                for collection_name in db.list_collection_names():
-                    # Get sample document to infer fields
-                    sample = db[collection_name].find_one()
-                    if sample:
-                        fields = list(sample.keys())
-                        mongodb_schema[f"{db_name}.{collection_name}"] = fields
-
-        return SchemaResponse(schema={**postgres_schema, **mongodb_schema})
+        return SchemaResponse(db_schema=postgres_schema)
     except Exception as e:
         logger.error(f"Error getting schema: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -111,9 +102,23 @@ async def execute_query(request: QueryRequest, api_key: str = Depends(get_api_ke
     """Execute natural language query"""
     try:
         if request.db_type == "postgresql":
-            # Execute PostgreSQL query
+            # Detect if the query is not SQL (very basic check, you can improve this)
+            if not request.query.strip().lower().startswith(("select", "insert", "update", "delete", "with")):
+                # Get schema as a string (you may need to adjust this)
+                inspector = inspect(postgres_engine)
+                schema = ""
+                for table_name in inspector.get_table_names():
+                    columns = [col['name']
+                               for col in inspector.get_columns(table_name)]
+                    schema += f"{table_name}({', '.join(columns)})\n"
+                # Translate NL to SQL
+                request.query = await llm_manager.generate_query(
+                    schema=schema,
+                    natural_language=request.query,
+                    db_type="PostgreSQL"
+                )
             with postgres_engine.connect() as conn:
-                result = conn.execute(request.query).fetchall()
+                result = conn.execute(text(request.query)).fetchall()
                 return QueryResponse(
                     query=request.query,
                     result=[dict(row) for row in result]

@@ -22,7 +22,7 @@ class SQLite(BaseDB):
         """Establish database connection"""
         try:
             with self.engine.connect() as conn:
-                conn.execute(text("SELECT 1"))
+                conn.execute(text('SELECT 1'))
             self.inspector = inspect(self.engine)
             return True
         except SQLAlchemyError as e:

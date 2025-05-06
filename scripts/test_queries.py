@@ -14,6 +14,18 @@ API_URL = "http://localhost:8000"
 API_KEY = os.getenv("API_KEY")
 
 
+# Add retry logic at the top of the file
+from requests.adapters import HTTPAdapter
+from requests.packages.urllib3.util.retry import Retry
+
+# Add after line 14 (API_URL = ...)
+session = requests.Session()
+retries = Retry(total=3, backoff_factor=1)
+session.mount('http://', HTTPAdapter(max_retries=retries))
+
+# Modify line 20 (health check)
+response = session.get(f"{API_URL}/health", timeout=10)
+
 def test_health_check():
     """Test health check endpoint"""
     print("\nTesting health check...")
